@@ -14,7 +14,7 @@ import gi
 gi.require_version("Atspi", "2.0")
 from gi.repository import Atspi, GLib
 
-from orca import focus_manager, document_presenter, command_manager, keybindings
+from orca import command_manager, focus_manager, document_presenter
 from orca import speech_generator
 from orca.scripts.web import speech_generator as web_speech_generator
 from orca.scripts import default as default_script
@@ -24,7 +24,8 @@ from orca.ax_utilities import AXUtilities
 
 from .config import Config, THEMES_DIR
 from .role_map import ROLE_TO_SOUND, MODE_SOUNDS
-from .sound_player import get_player, get_overlay_player, get_screen_size, set_output_device, move_orca_streams
+from .sound_player import (get_player, get_overlay_player, get_screen_size,
+                           reset_players, set_output_device, move_orca_streams)
 
 _log = logging.getLogger("orca-audio-themes")
 
@@ -518,44 +519,120 @@ def _patched_set_presentation_mode(self, script, use_focus_mode, obj=None,
     return result
 
 
+# Sticky mode has to be hooked in two places, and a guard keeps them from
+# both firing for one keypress. See _wrap_sticky_commands for why.
+_sticky_announcing = False
+
+_STICKY_COMMANDS = (
+    ("enable_sticky_focus_mode", "focus_mode_sticky"),
+    ("enable_sticky_browse_mode", "browse_mode_sticky"),
+)
+
+# [(command, original_function)] for uninstall.
+_wrapped_sticky_commands: list = []
+
+
+def _announce_sticky(call, sound_key):
+    """Run `call`, muting Orca's own message if configured, then play a sound."""
+    global _sticky_announcing
+    if _sticky_announcing:
+        return call()
+    _sticky_announcing = True
+    try:
+        if _should_suppress_mode_speech():
+            with _mute_present_message(None):
+                result = call()
+        else:
+            result = call()
+    finally:
+        _sticky_announcing = False
+    _play_mode_sound(sound_key)
+    return result
+
+
+def _sticky_command_wrapper(original, sound_key):
+    """Return a wrapper around a sticky-mode command's stored function."""
+
+    def wrapper(*args, **kwargs):
+        return _announce_sticky(lambda: original(*args, **kwargs), sound_key)
+
+    wrapper._audio_themes_sticky = True
+    return wrapper
+
+
+def _wrap_sticky_commands() -> None:
+    """Wrap Orca's sticky-mode commands so pressing the key plays a sound.
+
+    Patching DocumentPresenter is not enough on its own. Orca builds these
+    commands as
+    ``KeyboardCommand("enable_sticky_focus_mode", owner.enable_sticky_focus_mode, ...)``,
+    which captures a *bound method* when commands are set up -- and that
+    happens during script setup, before user extensions are sent on_ready().
+    The stored callable therefore never sees a class-level patch applied
+    later, so the keypress path produced no sound at all. Nor does
+    enable_sticky_*_mode call _set_presentation_mode, so the other hook
+    could not stand in for it.
+
+    The class-level patches are still needed: Orca's own automatic
+    sticky-focus calls go through the class and so only hit those.
+    """
+    manager = command_manager.get_manager()
+    for name, sound_key in _STICKY_COMMANDS:
+        command = manager.get_keyboard_command(name)
+        if command is None:
+            _log.warning(
+                "AudioThemes: command %s is not registered; sticky mode will be silent", name
+            )
+            continue
+        original = command.get_function()
+        if getattr(original, "_audio_themes_sticky", False):
+            continue
+        command.set_function(_sticky_command_wrapper(original, sound_key))
+        _wrapped_sticky_commands.append((command, original))
+        _log.info("AudioThemes: wrapped the %s command for sticky mode sounds", name)
+
+
+def _unwrap_sticky_commands() -> None:
+    """Restore the original functions on Orca's sticky-mode commands."""
+    while _wrapped_sticky_commands:
+        command, original = _wrapped_sticky_commands.pop()
+        try:
+            command.set_function(original)
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            _log.warning("AudioThemes: could not restore a sticky command: %s", error)
+
+
 def _patched_enable_sticky_focus(self, script, event=None, notify_user=True):
     """Wrapper around DocumentPresenter.enable_sticky_focus_mode."""
-    if _should_suppress_mode_speech():
-        with _mute_present_message(None):
-            result = _orig_enable_sticky_focus(self, script, event, notify_user)
-    else:
-        result = _orig_enable_sticky_focus(self, script, event, notify_user)
-    _play_mode_sound("focus_mode_sticky")
-    return result
+    return _announce_sticky(
+        lambda: _orig_enable_sticky_focus(self, script, event, notify_user),
+        "focus_mode_sticky",
+    )
 
 
 def _patched_enable_sticky_browse(self, script, event=None, notify_user=True):
     """Wrapper around DocumentPresenter.enable_sticky_browse_mode."""
-    if _should_suppress_mode_speech():
-        with _mute_present_message(None):
-            result = _orig_enable_sticky_browse(self, script, event, notify_user)
-    else:
-        result = _orig_enable_sticky_browse(self, script, event, notify_user)
-    _play_mode_sound("browse_mode_sticky")
-    return result
+    return _announce_sticky(
+        lambda: _orig_enable_sticky_browse(self, script, event, notify_user),
+        "browse_mode_sticky",
+    )
 
 
 # ---------------------------------------------------------------------------
 # Settings GUI keybinding
 # ---------------------------------------------------------------------------
 
-_keybinding_registered = False
-
-
-def _open_settings(script, event=None):
-    """Keybinding handler for Orca+Ctrl+A."""
+def open_settings() -> bool:
+    """Command handler for Orca+Ctrl+A. Opens the hand-written dialog."""
     GLib.idle_add(_show_settings_ui)
     return True
 
 
 def _show_settings_ui() -> bool:
     """Open the settings dialog on the main thread."""
-    global _config
+    if _config is None:
+        _log.error("AudioThemes: settings requested before the extension was started.")
+        return False
     try:
         from .config_ui import show_settings_dialog
         show_settings_dialog(_config, on_save=_on_settings_saved)
@@ -577,37 +654,12 @@ def _on_settings_saved(config: Config) -> None:
     _config = config
 
 
-def _register_keybinding() -> bool:
-    """Register Orca+Ctrl+A for the settings dialog."""
-    global _keybinding_registered
-    if _keybinding_registered:
-        return False
-    try:
-        manager = command_manager.get_manager()
-        kb = keybindings.KeyBinding("a", keybindings.ORCA_CTRL_MODIFIER_MASK)
-        manager.add_command(
-            command_manager.KeyboardCommand(
-                name="audioThemesSettings",
-                function=_open_settings,
-                group_label="Audio Themes",
-                description="Open Audio Themes settings",
-                desktop_keybinding=kb,
-                laptop_keybinding=kb,
-            )
-        )
-        _keybinding_registered = True
-        _log.info("AudioThemes: keybinding Orca+Ctrl+A registered")
-    except Exception as e:
-        _log.error("AudioThemes: failed to register keybinding: %s", e)
-    return False
-
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def install() -> None:
-    """Apply all monkey-patches and register keybinding. Called from orca-customizations.py."""
+def install(config: Config) -> None:
+    """Apply all monkey-patches. Called from the Extension's lifecycle hooks."""
     global _config, _installed
     global _orig_set_locus, _orig_set_presentation_mode
     global _orig_enable_sticky_focus, _orig_enable_sticky_browse
@@ -620,12 +672,22 @@ def install() -> None:
     if _installed:
         return
 
-    _config = Config.load()
+    _config = config
 
-    # Apply saved audio output device
+    # Apply saved audio output device. The stream move waits for Speech
+    # Dispatcher to have a stream to move; bind the device name now rather
+    # than reading the global later, which by then may be a different
+    # config object or None.
     if _config.audio_output:
-        set_output_device(_config.audio_output)
-        GLib.timeout_add(2000, lambda: move_orca_streams(_config.audio_output) or False)
+        device = _config.audio_output
+        set_output_device(device)
+
+        def _move_streams_once() -> bool:
+            if _installed:
+                move_orca_streams(device)
+            return False
+
+        GLib.timeout_add(2000, _move_streams_once)
 
     # Patch focus changes
     _orig_set_locus = focus_manager.FocusManager.set_locus_of_focus
@@ -672,8 +734,9 @@ def install() -> None:
     _orig_enable_sticky_browse = document_presenter.DocumentPresenter.enable_sticky_browse_mode
     document_presenter.DocumentPresenter.enable_sticky_browse_mode = _patched_enable_sticky_browse
 
-    # Register keybinding on the main thread
-    GLib.idle_add(_register_keybinding)
+    # The class patches above only catch Orca's internal auto-sticky calls;
+    # the keyboard commands hold bound methods captured before we loaded.
+    _wrap_sticky_commands()
 
     _installed = True
     _log.info(
@@ -684,7 +747,7 @@ def install() -> None:
 
 def uninstall() -> None:
     """Remove all monkey-patches and restore originals."""
-    global _installed
+    global _installed, _config
 
     if not _installed:
         return
@@ -716,7 +779,12 @@ def uninstall() -> None:
     if _orig_enable_sticky_browse is not None:
         document_presenter.DocumentPresenter.enable_sticky_browse_mode = _orig_enable_sticky_browse
 
-    get_player().shutdown()
-    get_overlay_player().shutdown()
+    _unwrap_sticky_commands()
+
+    # reset_players(), not get_player().shutdown(): the latter would build
+    # a pipeline just to tear it down if nothing had played yet, and would
+    # leave the singletons pointing at dead players.
+    reset_players()
     _installed = False
+    _config = None
     _log.info("AudioThemes: uninstalled")

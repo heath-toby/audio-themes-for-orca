@@ -14,11 +14,13 @@ Sound theme support for the [Orca screen reader](https://wiki.gnome.org/Projects
 - **Theme support** — installable sound themes with a built-in editor for creating custom themes
 - **NVDA compatibility** — import NVDA `.atp` theme packages directly; numeric filenames are automatically translated
 - **Settings GUI** — full configuration dialog accessible via Orca+Ctrl+A
-- **Non-invasive** — uses `orca-customizations.py` and GSettings; no Orca source code is modified
+- **Non-invasive** — an Orca 51 user extension; no Orca source code is modified
 
 ## Requirements
 
-- Orca screen reader
+- Orca **51 or later** — this is a user extension, and the extension system did not
+  exist before 51. (Version 1.x loaded itself from `orca-customizations.py` and works on
+  Orca 50 and earlier.)
 - GStreamer 1.0 with `gst-plugins-good` (for `audiopanorama` and `equalizer-3bands`)
 - PipeWire (for `pw-play` in sound preview)
 - `sox` (optional, for generating mode-change sounds during install)
@@ -36,6 +38,26 @@ Then restart Orca:
 ```bash
 orca --replace &
 ```
+
+The installer puts the code in `~/.local/share/orca/extensions/audio_themes/` and approves
+it with `orca --approve-extension audio_themes`. Themes go somewhere separate —
+`~/.local/share/orca/audio-themes/themes/` — for reasons explained under
+[Where themes live](#where-themes-live). Existing themes are never overwritten, so edits
+and imported themes survive a reinstall; themes from a version 1.x install are carried
+across the first time.
+
+Orca approves extensions **by content hash** and refuses to load one whose files have
+changed since approval, so after editing anything under `audio_themes/` re-run
+`./install.sh` — it re-approves as part of installing.
+
+### Upgrading from version 1.x
+
+Nothing to do. Settings used to live in a private GSettings schema,
+`org.gnome.Orca.AudioThemes`; they now use Orca's own per-extension settings store. The
+first time the extension runs it imports every value from the old schema and marks the
+import done so it never runs twice. Your themes are moved out of the old add-on folder by
+the installer. The old schema and its values are left in place;
+`./uninstall.sh --purge` removes them along with your themes.
 
 ## Uninstallation
 
@@ -99,11 +121,38 @@ filesrc -> decodebin -> audioconvert -> equalizer-3bands -> audiopanorama -> vol
 - **Horizontal panning** (`audiopanorama`): maps X screen position to stereo pan
 - **Vertical tone shift** (`equalizer-3bands`): objects near the top sound brighter, objects near the bottom sound warmer
 
-Configuration is stored via GSettings at `org.gnome.Orca.AudioThemes`.
+Configuration is stored in Orca's own per-extension settings store, which `dconf` keeps
+under `/org/gnome/orca/<profile>/extensions/audio-themes/` — Orca sanitises the
+`audio_themes` namespace by turning the underscore into a dash, so the settings path and
+the package name are spelled differently.
+
+### Why there is no entry under Orca's extension preferences
+
+Orca 51 lets an extension declare its settings and get a dialog generated for free. Audio
+Themes declares none, on purpose, so the **Settings button in Orca Preferences → User
+Extensions is deliberately inactive**. That generated dialog can only render simple
+declarative controls — booleans, strings, enums, numbers. It cannot host the theme
+editor's per-role **Preview** buttons, its sound choosers, or theme import and export, and
+there is no hook for an extension to supply its own dialog in place of it. Declaring
+preferences would produce a second, poorer settings dialog beside the real one.
+**Orca+Ctrl+A is the single place Audio Themes is configured.**
+
+### Where themes live
+
+Themes are installed to `~/.local/share/orca/audio-themes/themes/`, *outside* the
+extension package. This matters more than it looks.
+
+Orca approves a user extension by hashing every file in its directory, and refuses to load
+it if anything changed since approval. The settings dialog writes themes at runtime —
+importing a theme, duplicating one, or assigning a sound to a role in the theme editor all
+copy files in. If themes sat inside the package, the first time you edited one the
+extension would silently un-approve itself, and Audio Themes would simply stop loading the
+next time Orca started, with nothing but a debug-log line to say why. Keeping themes
+outside means the package holds only code, whose hash changes only when the code does.
 
 ## Creating Custom Themes
 
-A theme is a directory containing WAV files named after UI roles. Place your theme in `~/.local/share/orca/audio_themes/themes/<your-theme>/` with an `info.json`:
+A theme is a directory containing WAV files named after UI roles. Place your theme in `~/.local/share/orca/audio-themes/themes/<your-theme>/` with an `info.json`:
 
 ```json
 {

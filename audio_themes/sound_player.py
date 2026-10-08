@@ -125,12 +125,16 @@ class AudioThemePlayer:
                 pad.link(sink_pad)
 
     def _on_eos(self, _bus: Gst.Bus, _msg: Gst.Message) -> None:
-        self._pipeline.set_state(Gst.State.NULL)
+        # A message can still be in flight when shutdown() has already
+        # dropped the pipeline, so never assume it is still there.
+        if self._pipeline is not None:
+            self._pipeline.set_state(Gst.State.NULL)
 
     def _on_error(self, _bus: Gst.Bus, msg: Gst.Message) -> None:
         error, info = msg.parse_error()
         _log.error("AudioThemePlayer: %s (%s)", error, info)
-        self._pipeline.set_state(Gst.State.NULL)
+        if self._pipeline is not None:
+            self._pipeline.set_state(Gst.State.NULL)
 
     def play(
         self,
@@ -183,9 +187,20 @@ class AudioThemePlayer:
             self._pipeline.set_state(Gst.State.NULL)
 
     def shutdown(self) -> None:
-        """Release all GStreamer resources."""
+        """Release all GStreamer resources. The player is dead afterwards.
+
+        A shut-down player can never play again -- play() finds no
+        pipeline and returns. Anything holding one must therefore drop it;
+        see reset_players(), which is what uninstall() calls.
+        """
         self.stop()
-        self._pipeline = None
+        pipeline, self._pipeline = self._pipeline, None
+        if pipeline is not None:
+            # Otherwise the watch keeps a GSource -- and this object --
+            # alive for the rest of the session.
+            bus = pipeline.get_bus()
+            if bus is not None:
+                bus.remove_signal_watch()
 
 
 # Module-level singletons
@@ -212,16 +227,28 @@ def get_overlay_player() -> AudioThemePlayer:
 
 def set_output_device(device: str) -> None:
     """Change the audio output device. Rebuilds players on next use."""
-    global _player, _overlay_player, _current_device
+    global _current_device
     if device == _current_device:
         return
     _current_device = device
-    if _player is not None:
-        _player.shutdown()
-        _player = None
-    if _overlay_player is not None:
-        _overlay_player.shutdown()
-        _overlay_player = None
+    reset_players()
+
+
+def reset_players() -> None:
+    """Shut down both players and forget them, so the next use rebuilds.
+
+    Shutting a player down without this leaves the singleton pointing at a
+    corpse: get_player() hands back the same object, its pipeline is None,
+    and play() silently does nothing for the rest of the session. That
+    matters now that Orca can disable and re-enable an extension at will --
+    before the extension system there was no path back from a teardown.
+    """
+    global _player, _overlay_player
+    for player in (_player, _overlay_player):
+        if player is not None:
+            player.shutdown()
+    _player = None
+    _overlay_player = None
 
 
 def move_orca_streams(sink_name: str) -> None:
