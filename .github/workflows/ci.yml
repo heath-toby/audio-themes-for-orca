@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    name: syntax + lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: install ruff
+        run: python -m pip install ruff
+      - name: compile every .py (catches typos and broken syntax)
+        run: find . -name '*.py' -not -path './.git/*' -print0 | xargs -0 python -m compileall -q
+      - name: ruff check
+        # Not --fail-on-warnings: ruff is advisory for us. We just want to
+        # see the output.
+        run: ruff check . || true
+
+  import-check:
+    name: import against Orca master
+    # The extension targets Orca 51+. Ubuntu's apt-shipped Orca is older,
+    # so we clone upstream master. The job stubs the two meson-generated
+    # files (orca_i18n, orca_platform) rather than running meson, since
+    # the intent is static import-check, not running Orca.
+    #
+    # continue-on-error: Atspi's gi namespace only populates enum values
+    # like Atspi.Role.BUTTON when a live at-spi registry is running.
+    # Launching one in CI is possible (xvfb + dbus-session + at-spi2-
+    # registryd) but introduces its own fragility. For now the hard gate
+    # is the syntax+lint job above; the import check is a best-effort
+    # signal that fires only when the environment cooperates.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: system deps (accessibility + GTK typelibs + louis)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            python3-gi python3-louis \
+            gir1.2-glib-2.0 gir1.2-gobject-2.0 \
+            gir1.2-atspi-2.0 gir1.2-atk-1.0 \
+            gir1.2-gtk-3.0 gir1.2-gtk-4.0 \
+            gir1.2-gdk-3.0 gir1.2-gdkpixbuf-2.0 \
+            gir1.2-pango-1.0 gir1.2-cairo-1.0 \
+            at-spi2-core libatspi2.0-dev
+
+      - name: install Orca (master from git)
+        run: |
+          git clone --depth 1 https://gitlab.gnome.org/GNOME/orca.git /tmp/orca
+          # Stub the two meson-generated files so we skip meson/ninja.
+          cat > /tmp/orca/src/orca/orca_i18n.py <<'PY'
+          """CI stub for the meson-generated orca_i18n module."""
+          from gettext import gettext as _
+          def C_(ctx, s): return s
+          def ngettext(a, b, n): return a if n == 1 else b
+          PY
+          cat > /tmp/orca/src/orca/orca_platform.py <<'PY'
+          """CI stub for the meson-generated orca_platform module."""
+          version = "master"
+          revision = "ci-stub"
+          prefix = "/usr"
+          datadir = "/usr/share"
+          localedir = "/usr/share/locale"
+          PY
+          echo "PYTHONPATH=/tmp/orca/src:/usr/lib/python3/dist-packages:$PYTHONPATH" >> "$GITHUB_ENV"
+
+      - name: install Python runtime dependencies
+        # Do NOT upgrade pip (collides with debian's pip in dist-packages).
+        # dasbus is an Orca transitive dep.
+        run: python -m pip install dasbus
+
+      - name: import the extension
+        run: |
+          export PYTHONPATH="$PWD:$PYTHONPATH"
+          python - <<'PY'
+          import importlib, sys
+          targets = ["audio_themes"]
+          failed = []
+          for name in targets:
+              try:
+                  importlib.import_module(name)
+                  print(f"ok   {name}")
+              except Exception as e:
+                  print(f"FAIL {name}: {type(e).__name__}: {e}")
+                  failed.append((name, e))
+          sys.exit(1 if failed else 0)
+          PY
