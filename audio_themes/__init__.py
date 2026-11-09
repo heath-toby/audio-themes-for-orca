@@ -7,7 +7,13 @@ editing. Sound themes live outside the package for exactly that reason --
 see ``config.THEMES_DIR``.
 """
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
+
+# Not installed into the extension package, and not replaced by an
+# update. The themes live in orca/audio-themes/themes/ instead,
+# because Orca's approval hash covers every file in the package, so a
+# theme edited in place would silently un-approve this extension.
+__update_exclude__ = ("themes",)
 
 import logging
 
@@ -43,8 +49,12 @@ class AudioThemes(Extension):
 
     GROUP_LABEL = "Audio Themes"
     DESCRIPTION = "Plays a distinct sound when focus moves between kinds of control, and on browse and focus mode changes, with optional 2D positional audio."
-    VERSION = "2.0.0"  # keep in sync with __version__; read by AST, must be a literal
+    VERSION = "2.0.1"  # keep in sync with __version__; read by AST, must be a literal
     AUTHOR = "Toby"
+    # Read by Orca without importing this module, and by Extension Updater
+    # to find this add-on's releases. Orca shows it as a link in
+    # Preferences -> User Extensions -> Info.
+    WEBSITE = "https://github.com/heath-toby/audio-themes-for-orca"
 
     def __init__(self) -> None:
         super().__init__()

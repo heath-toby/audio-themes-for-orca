@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.0.1
+
+Declares `WEBSITE`, so [Extension Updater][eu] can find this add-on's
+releases. Orca reads that field with `ast`, without importing the extension,
+and shows it as a link in Preferences -> User Extensions -> Info.
+
+No behaviour changes.
+
+Also declares `__update_exclude__ = ("themes",)`, so an update replaces the
+code and leaves the themes alone. The themes live in
+`orca/audio-themes/themes/` rather than inside the package, because Orca's
+approval hash covers every file in the package and a theme edited in place
+would silently un-approve the extension.
+
+[eu]: https://github.com/heath-toby/orca-extension-updater
+
 ## 2.0.0
 
 Audio Themes is now a **first-class Orca 51 user extension** rather than an add-on that
